@@ -1,5 +1,5 @@
 // Deno Deploy: Telegram bot + Deno KV + Supabase rows + Supabase Storage files + Debug
-// ENV required:
+// ENV:
 // BOT_TOKEN, DASHBOARD_URL, TIMEZONE=America/Chicago
 // REPORT_CHAT_ID (opt), REPORT_THREAD_ID (opt)
 // SUPABASE_URL=https://XXXX.supabase.co, SUPABASE_KEY=<service_role>, SUPABASE_BUCKET=invoices
@@ -130,14 +130,14 @@ async function statsWeekMonth() {
   return { week, month };
 }
 
-// ---------- Supabase rows ----------
+// ---------- Supabase rows (без file_url в body) ----------
 async function saveSupabase(e: Entry) {
   if (!SUPABASE_URL || !SUPABASE_KEY) { await logErr("db/env-missing", { SUPABASE_URL: !!SUPABASE_URL, SUPABASE_KEY: !!SUPABASE_KEY }); return; }
   const url = `${SUPABASE_URL}/rest/v1/entries`;
-  const body = {
+  const body: Record<string, unknown> = {
     ts: e.ts, asset: e.asset, unit: e.unit, repair: e.repair,
     total: e.total, paid_by: e.paid_by, comments: e.comments ?? null,
-    reporter: e.reporter ?? null, file_id: e.file_id ?? null, file_url: e.file_url ?? null,
+    reporter: e.reporter ?? null, file_id: e.file_id ?? null,
     msg_key: e.msg_key
   };
   const r = await fetch(url, {
@@ -340,7 +340,6 @@ Deno.serve(async (req) => {
       SUPABASE_KEY: !!SUPABASE_KEY,
       SUPABASE_BUCKET
     };
-    // пробуем HEAD к public объекту, которого нет, чтобы проверить CORS/доступ
     const probe = SUPABASE_URL
       ? `${SUPABASE_URL}/storage/v1/object/public/${encodeURIComponent(SUPABASE_BUCKET)}/__probe__.txt`
       : "";
@@ -352,7 +351,6 @@ Deno.serve(async (req) => {
   }
 
   if (req.method === "GET" && url.pathname === "/self-test") {
-    // вставка тестовой строки и загрузка тестового файла
     const now = new Date().toISOString();
     const bytes = new TextEncoder().encode(`self-test at ${now}\n`);
     const path = `__selftest__/test_${now.replace(/[-:TZ.]/g,"").slice(0,14)}.txt`;
@@ -364,10 +362,6 @@ Deno.serve(async (req) => {
     };
     await saveSupabase(entry);
     return json({ ok: true, file_url: publicUrl });
-  }
-
-  if (req.method === "GET" && url.pathname.startsWith("/file/")) {
-    return new Response("removed: we store files in Supabase Storage", { status: 410 });
   }
 
   if (req.method === "POST" && url.pathname === "/hook") return handleHook(req);
