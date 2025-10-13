@@ -1,5 +1,8 @@
-// Deno Deploy: Telegram webhook + Deno KV + file proxy, no external storage
-// ENV: BOT_TOKEN, DASHBOARD_URL, TIMEZONE, REPORT_CHAT_ID, REPORT_THREAD_ID (optional)
+// Deno Deploy: Telegram webhook + Deno KV state + Supabase "table" + file proxy
+// ENV required in Deno Deploy:
+// BOT_TOKEN, DASHBOARD_URL, TIMEZONE=America/Chicago
+// REPORT_CHAT_ID, REPORT_THREAD_ID (optional)
+// SUPABASE_URL=<https://XXXX.supabase.co>, SUPABASE_KEY=<service_role>
 
 type Tg = { update_id?: number; message?: any; callback_query?: any };
 
@@ -10,12 +13,19 @@ const TZ = Deno.env.get("TIMEZONE") ?? "UTC";
 const REPORT_CHAT = Deno.env.get("REPORT_CHAT_ID") ?? "";
 const REPORT_THREAD = Deno.env.get("REPORT_THREAD_ID") ?? "";
 
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
+const SUPABASE_KEY = Deno.env.get("SUPABASE_KEY") ?? "";
+
 const kv = await Deno.openKv();
 
+// ---------- utils ----------
 const j = (x: unknown) => JSON.stringify(x);
 const json = (x: unknown, s = 200) =>
   new Response(j(x), { status: s, headers: { "content-type": "application/json" } });
-const firstLine = (t = "") => t.split(/\r?\n/).map(s => s.trim()).filter(Boolean)[0] ?? "";
+
+const firstLine = (t = "") =>
+  t.split(/\r?\n/).map(s => s.trim()).filter(Boolean)[0] ?? "";
+
 function parseAmount(s = "") {
   s = s.replace(/[^\d.,-]/g, "").trim();
   if (!s) return null;
@@ -25,12 +35,14 @@ function parseAmount(s = "") {
   const n = Number(s);
   return Number.isFinite(n) ? Math.round(n * 100) / 100 : null;
 }
-const safe = (s = "") => s.replace(/[^\w.-]/g, "_");
-const fmt = (d = new Date()) =>
-  new Intl.DateTimeFormat("en-CA", { timeZone: TZ, dateStyle: "short", timeStyle: "medium" }).format(d).replace(",", "");
 
+// ---------- Telegram ----------
 async function tg(method: string, payload: unknown) {
-  const r = await fetch(`${API}/${method}`, { method: "POST", headers: { "content-type": "application/json" }, body: j(payload) });
+  const r = await fetch(`${API}/${method}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: j(payload)
+  });
   if (!r.ok) throw new Error(`${method} ${r.status} ${await r.text()}`);
   return r.json();
 }
@@ -49,10 +61,13 @@ async function proxyFile(file_id: string): Promise<Response> {
   const url = `https://api.telegram.org/file/bot${BOT}/${path}`;
   const r = await fetch(url);
   if (!r.ok) return new Response("fail", { status: 502 });
-  return new Response(r.body, { status: 200, headers: { "content-type": r.headers.get("content-type") ?? "application/octet-stream" } });
+  return new Response(r.body, {
+    status: 200,
+    headers: { "content-type": r.headers.get("content-type") ?? "application/octet-stream" }
+  });
 }
 
-// State in KV
+// ---------- KV models ----------
 type State = {
   step: "asset"|"unit"|"repair"|"total"|"paid"|"comments"|"file"|"confirm";
   asset: string; unit: string; repair: string; total: number;
@@ -60,37 +75,72 @@ type State = {
   file_id?: string; file_kind?: "photo"|"document";
   reporter: string; msg_key: string;
 };
+type Entry = {
+  ts: string; asset: string; unit: string; repair: string; total: number;
+  paid_by: string; comments?: string; reporter: string; file_id?: string; msg_key: string;
+};
+
 const kState = (uid: number) => ["state", uid];
 const getState = async (uid: number) => (await kv.get<State>(kState(uid))).value ?? null;
 const setState = (uid: number, st: State) => kv.set(kState(uid), st, { expireIn: 6 * 3600_000 });
 const clearState = (uid: number) => kv.delete(kState(uid));
 
-// Entries in KV for reports
-type Entry = {
-  ts: string; asset: string; unit: string; repair: string; total: number;
-  paid_by: string; comments?: string; reporter: string; file_id?: string; msg_key: string;
-};
 const kEntry = (tsIso: string, msgKey: string) => ["entry", tsIso.slice(0,7), tsIso.slice(0,19), msgKey];
 async function addEntry(e: Entry) { await kv.set(kEntry(e.ts, e.msg_key), e); }
+
 async function statsWeekMonth() {
   const now = new Date(); const ym = now.toISOString().slice(0,7);
   let month = 0, week = 0; const weekAgo = new Date(now.getTime() - 7*86400_000);
   for await (const it of kv.list<Entry>({ prefix: ["entry", ym] })) {
-    const d = new Date(it.value.ts); month += it.value.total || 0; if (d >= weekAgo) week += it.value.total || 0;
+    const d = new Date(it.value.ts);
+    month += it.value.total || 0;
+    if (d >= weekAgo) week += it.value.total || 0;
   }
   return { week, month };
 }
 
-const kbMain = { keyboard: [[{text:"➕ New entry"},{text:"📊 Dashboard"}],[{text:"🧾 Status"},{text:"❌ Cancel"}]], resize_keyboard:true };
+// ---------- Supabase ----------
+async function saveSupabase(e: Entry) {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return;
+  const url = `${SUPABASE_URL}/rest/v1/entries`;
+  const body = {
+    ts: e.ts, asset: e.asset, unit: e.unit, repair: e.repair,
+    total: e.total, paid_by: e.paid_by, comments: e.comments ?? null,
+    reporter: e.reporter ?? null, file_id: e.file_id ?? null, msg_key: e.msg_key
+  };
+  const r = await fetch(url, {
+    method: "POST",
+    headers: {
+      "apikey": SUPABASE_KEY,
+      "Authorization": `Bearer ${SUPABASE_KEY}`,
+      "Content-Type": "application/json",
+      "Prefer": "return=minimal"
+    },
+    body: JSON.stringify(body)
+  });
+  if (!r.ok) console.log("supabase insert failed", r.status, await r.text());
+}
+
+// ---------- UI keyboards ----------
+const kbMain = {
+  keyboard: [
+    [{text:"➕ New entry"},{text:"📊 Dashboard"}],
+    [{text:"🧾 Status"},{text:"❌ Cancel"}]
+  ],
+  resize_keyboard:true
+};
 const ikAsset = { inline_keyboard: [[{text:"Truck",callback_data:"asset:Truck"},{text:"Trailer",callback_data:"asset:Trailer"}]] };
 const ikPaid  = { inline_keyboard: [[{text:"Company",callback_data:"paid:company"},{text:"Driver",callback_data:"paid:driver"}]] };
 const ikSkip  = { inline_keyboard: [[{text:"Skip",callback_data:"skip_comments"}]] };
 const ikConfirm = { inline_keyboard: [[{text:"✅ Save",callback_data:"confirm_save"},{text:"✖️ Cancel",callback_data:"confirm_cancel"}]] };
-const preview = (s: State) =>
-  ["<b>Preview</b>", `Asset: ${s.asset}`, `Unit: ${s.unit}`, `Repair: ${s.repair}`,
-   `Total: $${s.total.toFixed(2)}`, `Paid by: ${s.paidBy.toUpperCase()}`,
-   `Comments: ${s.comments||"-"}`, `Reporter: ${s.reporter}`, "", "Save this entry?`"].join("\n");
 
+const preview = (s: State) =>
+  ["<b>Preview</b>",
+   `Asset: ${s.asset}`, `Unit: ${s.unit}`, `Repair: ${s.repair}`,
+   `Total: $${s.total.toFixed(2)}`, `Paid by: ${s.paidBy.toUpperCase()}`,
+   `Comments: ${s.comments || "-"}`, `Reporter: ${s.reporter}`, "", "Save this entry?`"].join("\n");
+
+// ---------- message handlers ----------
 async function onMessage(m: any) {
   if (!m.chat || m.chat.type !== "private") return;
   const uid = m.from.id as number;
@@ -105,13 +155,19 @@ async function onMessage(m: any) {
 
   if (t === "🧾 Status" || t === "/status") {
     if (!st) return send(m.chat.id, 'No active entry. Tap "New entry".', { reply_markup: kbMain });
-    const lines = ["Current entry", `Step: ${st.step}`, `Asset: ${st.asset||""}`, `Unit: ${st.unit||""}`,
-      `Repair: ${st.repair||""}`, `Total: $${(st.total||0).toFixed(2)}`, `Paid by: ${st.paidBy||""}`,
-      `Comments: ${st.comments||"-"}`, `File: ${st.file_id ? "attached ✅" : "missing ❗"}`];
+    const lines = [
+      "Current entry", `Step: ${st.step}`, `Asset: ${st.asset||""}`, `Unit: ${st.unit||""}`,
+      `Repair: ${st.repair||""}`, `Total: $${(st.total||0).toFixed(2)}`,
+      `Paid by: ${st.paidBy||""}`, `Comments: ${st.comments||"-"}`,
+      `File: ${st.file_id ? "attached ✅" : "missing ❗"}`
+    ];
     return send(m.chat.id, lines.join("\n"), { reply_markup: kbMain });
   }
 
-  if (t === "❌ Cancel" || t === "/cancel") { await clearState(uid); return send(m.chat.id, "Canceled.", { reply_markup: kbMain }); }
+  if (t === "❌ Cancel" || t === "/cancel") {
+    await clearState(uid);
+    return send(m.chat.id, "Canceled.", { reply_markup: kbMain });
+  }
 
   if (t === "➕ New entry" || t === "/new" || !st) {
     st = {
@@ -167,7 +223,9 @@ async function onCallback(q: any) {
   if (data.startsWith("paid:")) {
     st.paidBy = data.split(":")[1];
     st.step = "comments"; await setState(uid, st);
-    await edit(q.message.chat.id, q.message.message_id, "Any comments? Tap Skip if none.", { reply_markup: ikSkip });
+    await edit(q.message.chat.id, q.message.message_id, "Any comments? Tap Skip if none.", {
+      reply_markup: { inline_keyboard: [[{ text:"Skip", callback_data:"skip_comments"}]] }
+    });
     return answerCb(q.id);
   }
   if (data === "skip_comments") {
@@ -178,10 +236,12 @@ async function onCallback(q: any) {
   if (data === "confirm_save") {
     const tsStr = new Date().toISOString();
     const entry: Entry = {
-      ts: tsStr, asset: st.asset, unit: st.unit, repair: st.repair, total: st.total,
-      paid_by: st.paidBy, comments: st.comments, reporter: st.reporter, file_id: st.file_id || "", msg_key: st.msg_key
+      ts: tsStr, asset: st.asset, unit: st.unit, repair: st.repair,
+      total: st.total, paid_by: st.paidBy, comments: st.comments,
+      reporter: st.reporter, file_id: st.file_id || "", msg_key: st.msg_key
     };
-    await addEntry(entry);
+    await addEntry(entry);       // KV for quick stats
+    await saveSupabase(entry);   // Supabase "table"
     await clearState(uid);
     await edit(q.message.chat.id, q.message.message_id, "ok");
     return answerCb(q.id);
@@ -194,6 +254,7 @@ async function onCallback(q: any) {
   return answerCb(q.id);
 }
 
+// ---------- webhook/cron ----------
 async function handleHook(req: Request) {
   const u = (await req.json()) as Tg;
   if (typeof u.update_id === "number") {
@@ -209,11 +270,7 @@ async function handleHook(req: Request) {
 
 async function sendReport(title: "Weekly report" | "Monthly report") {
   if (!REPORT_CHAT) return json({ ok: true });
-  const now = new Date(); const ym = now.toISOString().slice(0,7);
-  let month = 0, week = 0; const weekAgo = new Date(now.getTime() - 7*86400_000);
-  for await (const it of kv.list<Entry>({ prefix: ["entry", ym] })) {
-    const d = new Date(it.value.ts); month += it.value.total || 0; if (d >= weekAgo) week += it.value.total || 0;
-  }
+  const { week, month } = await statsWeekMonth();
   const txt = title === "Weekly report"
     ? `Weekly report\nTotal last 7 days: $${week.toFixed(2)}`
     : `Monthly report\nMonth-to-date: $${month.toFixed(2)}`;
@@ -224,9 +281,11 @@ async function sendReport(title: "Weekly report" | "Monthly report") {
   return json({ ok: true });
 }
 
+// ---------- HTTP ----------
 Deno.serve(async (req) => {
   const url = new URL(req.url);
   if (req.method === "GET" && url.pathname === "/") return new Response("ok");
+  if (req.method === "GET" && url.pathname === "/health") return json({ ok: true });
   if (req.method === "GET" && url.pathname.startsWith("/file/")) {
     const file_id = url.pathname.split("/file/")[1];
     if (!file_id) return new Response("bad", { status: 400 });
