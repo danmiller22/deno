@@ -1,8 +1,8 @@
-// Deno Deploy: Telegram webhook + Deno KV state + Supabase "table" + file proxy
-// ENV required in Deno Deploy:
+// Deno Deploy: Telegram bot + Deno KV + Supabase rows + Supabase Storage files
+// ENV in Deno Deploy:
 // BOT_TOKEN, DASHBOARD_URL, TIMEZONE=America/Chicago
 // REPORT_CHAT_ID, REPORT_THREAD_ID (optional)
-// SUPABASE_URL=<https://XXXX.supabase.co>, SUPABASE_KEY=<service_role>
+// SUPABASE_URL=https://XXXX.supabase.co, SUPABASE_KEY=<service_role>, SUPABASE_BUCKET=invoices
 
 type Tg = { update_id?: number; message?: any; callback_query?: any };
 
@@ -15,6 +15,7 @@ const REPORT_THREAD = Deno.env.get("REPORT_THREAD_ID") ?? "";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 const SUPABASE_KEY = Deno.env.get("SUPABASE_KEY") ?? "";
+const SUPABASE_BUCKET = Deno.env.get("SUPABASE_BUCKET") ?? "invoices";
 
 const kv = await Deno.openKv();
 
@@ -35,6 +36,7 @@ function parseAmount(s = "") {
   const n = Number(s);
   return Number.isFinite(n) ? Math.round(n * 100) / 100 : null;
 }
+const safe = (s = "") => s.replace(/[^\w.-]/g, "_");
 
 // ---------- Telegram ----------
 async function tg(method: string, payload: unknown) {
@@ -56,15 +58,38 @@ async function tgFilePath(file_id: string) {
   const { result } = await tg("getFile", { file_id }) as any;
   return result.file_path as string;
 }
-async function proxyFile(file_id: string): Promise<Response> {
+async function downloadTelegramFile(file_id: string): Promise<{ bytes: Uint8Array; mime: string; filename: string }> {
   const path = await tgFilePath(file_id);
   const url = `https://api.telegram.org/file/bot${BOT}/${path}`;
-  const r = await fetch(url);
-  if (!r.ok) return new Response("fail", { status: 502 });
-  return new Response(r.body, {
-    status: 200,
-    headers: { "content-type": r.headers.get("content-type") ?? "application/octet-stream" }
+  const res = await fetch(url);
+  if (!res.ok) throw new Error("telegram download failed");
+  const mime = res.headers.get("content-type") ?? "application/octet-stream";
+  const ab = await res.arrayBuffer();
+  const bytes = new Uint8Array(ab);
+  const name = path.split("/").pop() || "file";
+  return { bytes, mime, filename: name };
+}
+
+// ---------- Supabase Storage (public bucket) ----------
+async function uploadToSupabase(bytes: Uint8Array, mime: string, destPath: string): Promise<string> {
+  if (!SUPABASE_URL || !SUPABASE_KEY) return "";
+  const url = `${SUPABASE_URL}/storage/v1/object/${encodeURIComponent(SUPABASE_BUCKET)}/${encodeURIComponent(destPath)}`;
+  const r = await fetch(url, {
+    method: "POST",
+    headers: {
+      "apikey": SUPABASE_KEY,
+      "Authorization": `Bearer ${SUPABASE_KEY}`,
+      "Content-Type": mime,
+      "x-upsert": "true"
+    },
+    body: bytes
   });
+  if (!r.ok) {
+    console.log("storage upload failed", r.status, await r.text());
+    return "";
+  }
+  // public URL (bucket must be public)
+  return `${SUPABASE_URL}/storage/v1/object/public/${encodeURIComponent(SUPABASE_BUCKET)}/${encodeURIComponent(destPath)}`;
 }
 
 // ---------- KV models ----------
@@ -77,7 +102,7 @@ type State = {
 };
 type Entry = {
   ts: string; asset: string; unit: string; repair: string; total: number;
-  paid_by: string; comments?: string; reporter: string; file_id?: string; msg_key: string;
+  paid_by: string; comments?: string; reporter: string; file_id?: string; file_url?: string; msg_key: string;
 };
 
 const kState = (uid: number) => ["state", uid];
@@ -99,14 +124,15 @@ async function statsWeekMonth() {
   return { week, month };
 }
 
-// ---------- Supabase ----------
+// ---------- Supabase rows ----------
 async function saveSupabase(e: Entry) {
   if (!SUPABASE_URL || !SUPABASE_KEY) return;
   const url = `${SUPABASE_URL}/rest/v1/entries`;
   const body = {
     ts: e.ts, asset: e.asset, unit: e.unit, repair: e.repair,
     total: e.total, paid_by: e.paid_by, comments: e.comments ?? null,
-    reporter: e.reporter ?? null, file_id: e.file_id ?? null, msg_key: e.msg_key
+    reporter: e.reporter ?? null, file_id: e.file_id ?? null, file_url: e.file_url ?? null,
+    msg_key: e.msg_key
   };
   const r = await fetch(url, {
     method: "POST",
@@ -121,7 +147,7 @@ async function saveSupabase(e: Entry) {
   if (!r.ok) console.log("supabase insert failed", r.status, await r.text());
 }
 
-// ---------- UI keyboards ----------
+// ---------- UI ----------
 const kbMain = {
   keyboard: [
     [{text:"➕ New entry"},{text:"📊 Dashboard"}],
@@ -140,7 +166,7 @@ const preview = (s: State) =>
    `Total: $${s.total.toFixed(2)}`, `Paid by: ${s.paidBy.toUpperCase()}`,
    `Comments: ${s.comments || "-"}`, `Reporter: ${s.reporter}`, "", "Save this entry?`"].join("\n");
 
-// ---------- message handlers ----------
+// ---------- handlers ----------
 async function onMessage(m: any) {
   if (!m.chat || m.chat.type !== "private") return;
   const uid = m.from.id as number;
@@ -235,13 +261,28 @@ async function onCallback(q: any) {
   }
   if (data === "confirm_save") {
     const tsStr = new Date().toISOString();
+
+    // download & upload file to Supabase Storage
+    let publicUrl = "";
+    if (st.file_id) {
+      try {
+        const { bytes, mime, filename } = await downloadTelegramFile(st.file_id);
+        const fname = `${tsStr.replace(/[-:TZ.]/g,"").slice(0,14)}_${st.asset}_${safe(st.unit)}_${filename}`;
+        const path = `${st.asset}/${safe(st.unit)}/${fname}`;
+        publicUrl = await uploadToSupabase(bytes, mime, path);
+      } catch (e) {
+        console.log("storage upload error", String(e));
+      }
+    }
+
     const entry: Entry = {
       ts: tsStr, asset: st.asset, unit: st.unit, repair: st.repair,
       total: st.total, paid_by: st.paidBy, comments: st.comments,
-      reporter: st.reporter, file_id: st.file_id || "", msg_key: st.msg_key
+      reporter: st.reporter, file_id: st.file_id || "", file_url: publicUrl || "", msg_key: st.msg_key
     };
+
     await addEntry(entry);       // KV for quick stats
-    await saveSupabase(entry);   // Supabase "table"
+    await saveSupabase(entry);   // Supabase table
     await clearState(uid);
     await edit(q.message.chat.id, q.message.message_id, "ok");
     return answerCb(q.id);
@@ -286,11 +327,6 @@ Deno.serve(async (req) => {
   const url = new URL(req.url);
   if (req.method === "GET" && url.pathname === "/") return new Response("ok");
   if (req.method === "GET" && url.pathname === "/health") return json({ ok: true });
-  if (req.method === "GET" && url.pathname.startsWith("/file/")) {
-    const file_id = url.pathname.split("/file/")[1];
-    if (!file_id) return new Response("bad", { status: 400 });
-    return proxyFile(file_id);
-  }
   if (req.method === "POST" && url.pathname === "/hook") return handleHook(req);
   if (req.method === "POST" && url.pathname === "/cron-weekly") return sendReport("Weekly report");
   if (req.method === "POST" && url.pathname === "/cron-monthly") return sendReport("Monthly report");
