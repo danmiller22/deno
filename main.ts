@@ -13,10 +13,11 @@ const REPORT_THREAD = Deno.env.get("REPORT_THREAD_ID") ?? "";
 const kv = await Deno.openKv();
 
 const j = (x: unknown) => JSON.stringify(x);
-const json = (x: unknown, s = 200) => new Response(j(x), { status: s, headers: { "content-type": "application/json" } });
+const json = (x: unknown, s = 200) =>
+  new Response(j(x), { status: s, headers: { "content-type": "application/json" } });
 const firstLine = (t = "") => t.split(/\r?\n/).map(s => s.trim()).filter(Boolean)[0] ?? "";
 function parseAmount(s = "") {
-  s = s.replace([^\d.,-]/g, "").trim();
+  s = s.replace(/[^\d.,-]/g, "").trim();
   if (!s) return null;
   const c = s.lastIndexOf(","), d = s.lastIndexOf(".");
   if (c > -1 && d > -1) s = (c > d) ? s.replace(/\./g, "") : s.replace(/,/g, "");
@@ -24,7 +25,7 @@ function parseAmount(s = "") {
   const n = Number(s);
   return Number.isFinite(n) ? Math.round(n * 100) / 100 : null;
 }
-const safe = (s = "") => s.replace([^\w.-]/g, "_");
+const safe = (s = "") => s.replace(/[^\w.-]/g, "_");
 const fmt = (d = new Date()) =>
   new Intl.DateTimeFormat("en-CA", { timeZone: TZ, dateStyle: "short", timeStyle: "medium" }).format(d).replace(",", "");
 
@@ -85,8 +86,10 @@ const ikAsset = { inline_keyboard: [[{text:"Truck",callback_data:"asset:Truck"},
 const ikPaid  = { inline_keyboard: [[{text:"Company",callback_data:"paid:company"},{text:"Driver",callback_data:"paid:driver"}]] };
 const ikSkip  = { inline_keyboard: [[{text:"Skip",callback_data:"skip_comments"}]] };
 const ikConfirm = { inline_keyboard: [[{text:"✅ Save",callback_data:"confirm_save"},{text:"✖️ Cancel",callback_data:"confirm_cancel"}]] };
-const preview = (s: State) => ["<b>Preview</b>", `Asset: ${s.asset}`, `Unit: ${s.unit}`, `Repair: ${s.repair}`, `Total: $${s.total.toFixed(2)}`,
-  `Paid by: ${s.paidBy.toUpperCase()}`, `Comments: ${s.comments||"-"}`, `Reporter: ${s.reporter}`, "", "Save this entry?"].join("\n");
+const preview = (s: State) =>
+  ["<b>Preview</b>", `Asset: ${s.asset}`, `Unit: ${s.unit}`, `Repair: ${s.repair}`,
+   `Total: $${s.total.toFixed(2)}`, `Paid by: ${s.paidBy.toUpperCase()}`,
+   `Comments: ${s.comments||"-"}`, `Reporter: ${s.reporter}`, "", "Save this entry?`"].join("\n");
 
 async function onMessage(m: any) {
   if (!m.chat || m.chat.type !== "private") return;
@@ -96,7 +99,7 @@ async function onMessage(m: any) {
   if (t === "/ping") return send(m.chat.id, "pong");
   if (t === "/start") return send(m.chat.id, "Welcome. Use buttons below.", { reply_markup: kbMain });
   if (t === "📊 Dashboard" || t === "/dashboard")
-    return send(m.chat.id, "Dashboard:", { reply_markup: { inline_keyboard: [[{ text: "Open Dashboard", url: (Deno.env.get("DASHBOARD_URL") ?? "") }] ] } });
+    return send(m.chat.id, "Dashboard:", { reply_markup: { inline_keyboard: [[{ text: "Open Dashboard", url: DASH }]] } });
 
   let st = await getState(uid);
 
@@ -214,7 +217,7 @@ async function sendReport(title: "Weekly report" | "Monthly report") {
   const txt = title === "Weekly report"
     ? `Weekly report\nTotal last 7 days: $${week.toFixed(2)}`
     : `Monthly report\nMonth-to-date: $${month.toFixed(2)}`;
-  const kb = { inline_keyboard: [[{ text: "Open Dashboard", url: (Deno.env.get("DASHBOARD_URL") ?? "") }]] };
+  const kb = { inline_keyboard: [[{ text: "Open Dashboard", url: DASH }]] };
   const extra: any = { reply_markup: kb };
   if (REPORT_THREAD) extra.message_thread_id = Number(REPORT_THREAD);
   await send(Number(REPORT_CHAT), txt, extra);
