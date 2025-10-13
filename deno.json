@@ -1,0 +1,6 @@
+{
+  "deploy": {
+    "project": "fleet-bot-deno",
+    "entrypoint": "main.ts"
+  }
+}
