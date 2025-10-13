@@ -1,7 +1,7 @@
-// Deno Deploy: Telegram bot + Deno KV + Supabase rows + Supabase Storage files
-// ENV in Deno Deploy:
+// Deno Deploy: Telegram bot + Deno KV + Supabase rows + Supabase Storage files + Debug
+// ENV required:
 // BOT_TOKEN, DASHBOARD_URL, TIMEZONE=America/Chicago
-// REPORT_CHAT_ID, REPORT_THREAD_ID (optional)
+// REPORT_CHAT_ID (opt), REPORT_THREAD_ID (opt)
 // SUPABASE_URL=https://XXXX.supabase.co, SUPABASE_KEY=<service_role>, SUPABASE_BUCKET=invoices
 
 type Tg = { update_id?: number; message?: any; callback_query?: any };
@@ -38,6 +38,13 @@ function parseAmount(s = "") {
 }
 const safe = (s = "") => s.replace(/[^\w.-]/g, "_");
 
+async function logErr(tag: string, detail: unknown) {
+  const rec = { ts: new Date().toISOString(), tag, detail };
+  console.error(tag, detail);
+  await kv.set(["err","last"], rec, { expireIn: 6*3600_000 });
+  await kv.set(["err", Date.now()], rec, { expireIn: 6*3600_000 });
+}
+
 // ---------- Telegram ----------
 async function tg(method: string, payload: unknown) {
   const r = await fetch(`${API}/${method}`, {
@@ -72,7 +79,7 @@ async function downloadTelegramFile(file_id: string): Promise<{ bytes: Uint8Arra
 
 // ---------- Supabase Storage (public bucket) ----------
 async function uploadToSupabase(bytes: Uint8Array, mime: string, destPath: string): Promise<string> {
-  if (!SUPABASE_URL || !SUPABASE_KEY) return "";
+  if (!SUPABASE_URL || !SUPABASE_KEY) { await logErr("storage/env-missing", { SUPABASE_URL: !!SUPABASE_URL, SUPABASE_KEY: !!SUPABASE_KEY }); return ""; }
   const url = `${SUPABASE_URL}/storage/v1/object/${encodeURIComponent(SUPABASE_BUCKET)}/${encodeURIComponent(destPath)}`;
   const r = await fetch(url, {
     method: "POST",
@@ -85,10 +92,9 @@ async function uploadToSupabase(bytes: Uint8Array, mime: string, destPath: strin
     body: bytes
   });
   if (!r.ok) {
-    console.log("storage upload failed", r.status, await r.text());
+    await logErr("storage/upload-failed", { status: r.status, text: await r.text(), url });
     return "";
   }
-  // public URL (bucket must be public)
   return `${SUPABASE_URL}/storage/v1/object/public/${encodeURIComponent(SUPABASE_BUCKET)}/${encodeURIComponent(destPath)}`;
 }
 
@@ -126,7 +132,7 @@ async function statsWeekMonth() {
 
 // ---------- Supabase rows ----------
 async function saveSupabase(e: Entry) {
-  if (!SUPABASE_URL || !SUPABASE_KEY) return;
+  if (!SUPABASE_URL || !SUPABASE_KEY) { await logErr("db/env-missing", { SUPABASE_URL: !!SUPABASE_URL, SUPABASE_KEY: !!SUPABASE_KEY }); return; }
   const url = `${SUPABASE_URL}/rest/v1/entries`;
   const body = {
     ts: e.ts, asset: e.asset, unit: e.unit, repair: e.repair,
@@ -144,7 +150,7 @@ async function saveSupabase(e: Entry) {
     },
     body: JSON.stringify(body)
   });
-  if (!r.ok) console.log("supabase insert failed", r.status, await r.text());
+  if (!r.ok) await logErr("db/insert-failed", { status: r.status, text: await r.text(), url, body });
 }
 
 // ---------- UI ----------
@@ -262,7 +268,6 @@ async function onCallback(q: any) {
   if (data === "confirm_save") {
     const tsStr = new Date().toISOString();
 
-    // download & upload file to Supabase Storage
     let publicUrl = "";
     if (st.file_id) {
       try {
@@ -271,7 +276,7 @@ async function onCallback(q: any) {
         const path = `${st.asset}/${safe(st.unit)}/${fname}`;
         publicUrl = await uploadToSupabase(bytes, mime, path);
       } catch (e) {
-        console.log("storage upload error", String(e));
+        await logErr("storage/download-or-upload", String(e));
       }
     }
 
@@ -281,8 +286,8 @@ async function onCallback(q: any) {
       reporter: st.reporter, file_id: st.file_id || "", file_url: publicUrl || "", msg_key: st.msg_key
     };
 
-    await addEntry(entry);       // KV for quick stats
-    await saveSupabase(entry);   // Supabase table
+    await addEntry(entry);
+    await saveSupabase(entry);
     await clearState(uid);
     await edit(q.message.chat.id, q.message.message_id, "ok");
     return answerCb(q.id);
@@ -322,11 +327,49 @@ async function sendReport(title: "Weekly report" | "Monthly report") {
   return json({ ok: true });
 }
 
-// ---------- HTTP ----------
+// ---------- HTTP debug ----------
 Deno.serve(async (req) => {
   const url = new URL(req.url);
   if (req.method === "GET" && url.pathname === "/") return new Response("ok");
   if (req.method === "GET" && url.pathname === "/health") return json({ ok: true });
+
+  if (req.method === "GET" && url.pathname === "/debug") {
+    const last = (await kv.get(["err","last"])).value;
+    const env = {
+      SUPABASE_URL: !!SUPABASE_URL,
+      SUPABASE_KEY: !!SUPABASE_KEY,
+      SUPABASE_BUCKET
+    };
+    // пробуем HEAD к public объекту, которого нет, чтобы проверить CORS/доступ
+    const probe = SUPABASE_URL
+      ? `${SUPABASE_URL}/storage/v1/object/public/${encodeURIComponent(SUPABASE_BUCKET)}/__probe__.txt`
+      : "";
+    let probeStatus = "n/a";
+    if (probe) {
+      try { const r = await fetch(probe, { method: "HEAD" }); probeStatus = String(r.status); } catch { probeStatus = "error"; }
+    }
+    return json({ ok: true, env, probe: { url: probe, status: probeStatus }, lastError: last ?? null });
+  }
+
+  if (req.method === "GET" && url.pathname === "/self-test") {
+    // вставка тестовой строки и загрузка тестового файла
+    const now = new Date().toISOString();
+    const bytes = new TextEncoder().encode(`self-test at ${now}\n`);
+    const path = `__selftest__/test_${now.replace(/[-:TZ.]/g,"").slice(0,14)}.txt`;
+    const publicUrl = await uploadToSupabase(bytes, "text/plain", path);
+    const entry: Entry = {
+      ts: now, asset: "TestAsset", unit: "T-001", repair: "Self-test write",
+      total: 1.23, paid_by: "company", comments: "self-test", reporter: "system",
+      file_id: "", file_url: publicUrl, msg_key: "selftest"
+    };
+    await saveSupabase(entry);
+    return json({ ok: true, file_url: publicUrl });
+  }
+
+  if (req.method === "GET" && url.pathname.startsWith("/file/")) {
+    return new Response("removed: we store files in Supabase Storage", { status: 410 });
+  }
+
   if (req.method === "POST" && url.pathname === "/hook") return handleHook(req);
   if (req.method === "POST" && url.pathname === "/cron-weekly") return sendReport("Weekly report");
   if (req.method === "POST" && url.pathname === "/cron-monthly") return sendReport("Monthly report");
