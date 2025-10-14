@@ -121,7 +121,8 @@ export async function onPhotoOrDoc(
     return sendMessage(chat, "Saved");
   } catch (e) {
     console.error("save error", e);
-    return sendMessage(chat, "Failed to save. Check Drive/Sheet access and try again.");
+    const msg = e instanceof Error ? e.message : String(e);
+    return sendMessage(chat, `Failed: ${msg}`);
   }
 }
 
