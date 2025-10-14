@@ -1,10 +1,10 @@
 import { ALLOWED_CHAT_IDS, DASHBOARD_MONTHLY_URL, DASHBOARD_WEEKLY_URL } from "./config.ts";
 import { answer, sendMessage } from "./telegram.ts";
 import { seen } from "./kv.ts";
-import { onPhoto, onText, start } from "./flow.ts";
+import { onPhotoOrDoc, onText, start } from "./flow.ts";
 
 function allowed(chatId: number, threadId?: number) {
-  if (ALLOWED_CHAT_IDS.length === 0) return true; // open for testing
+  if (ALLOWED_CHAT_IDS.length === 0) return true;
   const id = threadId ? `${chatId}:${threadId}` : String(chatId);
   return ALLOWED_CHAT_IDS.includes(id);
 }
@@ -19,16 +19,20 @@ async function handleTelegram(req: Request) {
     const threadId = msg?.is_topic_message ? msg?.message_thread_id as number : undefined;
     if (!allowed(chatId, threadId)) return answer("ignored");
 
+    const from = msg?.from || {};
     if (msg?.text) {
       const t: string = msg.text.trim();
-      if (t === "/start") { await sendMessage(chatId, "Use /new to submit an invoice. English only."); return start(chatId); }
-      if (t === "/new") { return start(chatId); }
+      if (t === "/start") {
+        await sendMessage(chatId, "Tap “New entry” to start.", { keyboard: [[{text:"New entry"}]], resize_keyboard:true });
+        return start(chatId, from);
+      }
+      if (t === "/new" || /^new entry$/i.test(t)) { return start(chatId, from); }
       if (t === "/cancel") { return sendMessage(chatId, "Cancelled"); }
-      if (t === "/help") { return sendMessage(chatId, "Steps: Asset type → Number → Location → Repair → Total → Comments → Reporter → Photo."); }
-      return onText(chatId, t);
+      if (t === "/help") { return sendMessage(chatId, "Steps: Asset type → Unit number → Location → Repair → Total → Comments → Invoice photo or file."); }
+      return onText(chatId, t, from);
     }
-    if (msg?.photo) {
-      return onPhoto(chatId, msg.message_id, msg.photo, msg.date);
+    if (msg?.photo || msg?.document) {
+      return onPhotoOrDoc(chatId, msg.message_id, msg.photo ?? null, msg.document ?? null, msg.date, from);
     }
     return answer("ok");
   } catch (e) {
