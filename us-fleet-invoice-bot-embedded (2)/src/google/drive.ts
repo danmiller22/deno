@@ -9,6 +9,8 @@ async function mustOk(res: Response) {
 
 export async function uploadInvoiceFromUrl(title: string, url: string, mime = "image/jpeg") {
   const token = await getAccessToken();
+
+  // файл создаём СРАЗУ в Shared Drive-папке
   const meta = { name: title, parents: [DRIVE_FOLDER_ID] };
   const boundary = "deno--" + crypto.randomUUID();
   const body = new Uint8Array([
@@ -18,7 +20,8 @@ export async function uploadInvoiceFromUrl(title: string, url: string, mime = "i
     ...new TextEncoder().encode(`\r\n--${boundary}--`),
   ]);
 
-  const up = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart", {
+  // ключевое: supportsAllDrives=true
+  const up = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true", {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": `multipart/related; boundary=${boundary}` },
     body,
@@ -26,7 +29,8 @@ export async function uploadInvoiceFromUrl(title: string, url: string, mime = "i
   await mustOk(up);
   const file = await up.json();
 
-  await mustOk(await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}/permissions`, {
+  // делаем публичную ссылку (также с supportsAllDrives)
+  await mustOk(await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}/permissions?supportsAllDrives=true`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ role: "reader", type: "anyone" }),
