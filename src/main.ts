@@ -10,29 +10,34 @@ function allowed(chatId: number, threadId?: number) {
 }
 
 async function handleTelegram(req: Request) {
-  const upd = await req.json();
-  if (await seen(upd.update_id)) return await answer("ok");
-  const msg = upd.message;
-  const chatId = msg?.chat?.id as number;
-  const threadId = msg?.is_topic_message ? msg?.message_thread_id as number : undefined;
-  if (!allowed(chatId, threadId)) return answer("ignored");
+  let upd: any = null;
+  try { upd = await req.json(); } catch { return new Response("ok", { status: 200 }); }
+  try {
+    if (await seen(upd.update_id)) return await answer("ok");
+    const msg = upd.message;
+    const chatId = msg?.chat?.id as number;
+    const threadId = msg?.is_topic_message ? msg?.message_thread_id as number : undefined;
+    if (!allowed(chatId, threadId)) return answer("ignored");
 
-  if (msg?.text) {
-    const t: string = msg.text.trim();
-    if (t === "/start") { await sendMessage(chatId, "Use /new to submit an invoice. English only."); return start(chatId); }
-    if (t === "/new") { return start(chatId); }
-    if (t === "/cancel") { return sendMessage(chatId, "Cancelled"); }
-    if (t === "/help") { return sendMessage(chatId, "Steps: Asset type → Number → Location → Repair → Total → Comments → Reporter → Photo."); }
-    return onText(chatId, t);
+    if (msg?.text) {
+      const t: string = msg.text.trim();
+      if (t === "/start") { await sendMessage(chatId, "Use /new to submit an invoice. English only."); return start(chatId); }
+      if (t === "/new") { return start(chatId); }
+      if (t === "/cancel") { return sendMessage(chatId, "Cancelled"); }
+      if (t === "/help") { return sendMessage(chatId, "Steps: Asset type → Number → Location → Repair → Total → Comments → Reporter → Photo."); }
+      return onText(chatId, t);
+    }
+    if (msg?.photo) {
+      return onPhoto(chatId, msg.message_id, msg.photo, msg.date);
+    }
+    return answer("ok");
+  } catch (e) {
+    console.error("webhook error", e);
+    return new Response("ok", { status: 200 });
   }
-  if (msg?.photo) {
-    return onPhoto(chatId, msg.message_id, msg.photo, msg.date);
-  }
-  return answer("ok");
 }
 
 async function weeklyBroadcast() {
-  // Send to all allowed chats
   for (const id of ALLOWED_CHAT_IDS) {
     const [chat] = id.split(":");
     await sendMessage(Number(chat), `Weekly dashboard: ${DASHBOARD_WEEKLY_URL}`);
