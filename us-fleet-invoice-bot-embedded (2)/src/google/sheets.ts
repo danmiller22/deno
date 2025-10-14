@@ -1,7 +1,8 @@
 import { getAccessToken } from "./auth.ts";
 import { SHEET_ID } from "../config.ts";
 
-const RANGE = "Sheet1!A1"; // change if your tab name is different
+// Пишем в лист "TMS"
+const RANGE = "TMS!A1";
 
 export async function appendRow(values: any[]) {
   const token = await getAccessToken();
@@ -11,7 +12,5 @@ export async function appendRow(values: any[]) {
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ values: [values] }),
   });
-  if (!res.ok) {
-    throw new Error(`Sheets HTTP ${res.status}: ${await res.text()}`);
-  }
+  if (!res.ok) throw new Error(`Sheets HTTP ${res.status}: ${await res.text()}`);
 }
