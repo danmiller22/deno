@@ -4,28 +4,36 @@ import { uploadInvoiceFromUrl } from "./google/drive.ts";
 import { getState, setState, setnx } from "./kv.ts";
 
 const ASK = {
-  assetType: () => kb([["Truck", "Trailer"], ["Cancel"]]),
-  location: () => kb([["Shop", "Roadside"], ["Yard", "TA/Petro"], ["Loves", "Other"]]),
-  reporter: () => kb([["Driver", "Dispatcher"], ["Mechanic", "Other"]]),
+  assetType: () => kb([["Truck","Trailer"]]),
+  location:  () => kb([["Shop","Roadside"],["Yard","TA/Petro"],["Loves","Other"]]),
 };
 
-export async function start(chat: number) {
-  await setState(chat, { step: "assetType" });
-  await sendMessage(chat, "Asset type?", ASK.assetType());
+function resolveReporter(from:any): string {
+  if (!from) return "Unknown";
+  if (from.username) return `@${from.username}`;
+  const n = [from.first_name, from.last_name].filter(Boolean).join(" ");
+  return n || "Unknown";
 }
 
-export async function onText(chat: number, text: string) {
-  const st = await getState(chat) || { step: "assetType" };
+export async function start(chat: number, from: any) {
+  await setState(chat, { step: "assetType", reportedBy: resolveReporter(from) });
+  await sendMessage(chat, "New entry", kb([["Truck","Trailer"]]));
+  await sendMessage(chat, "Select asset type:", ASK.assetType());
+}
+
+export async function onText(chat: number, text: string, from: any) {
+  const st = await getState(chat) || { step: "assetType", reportedBy: resolveReporter(from) };
+
   switch (st.step) {
     case "assetType": {
-      if (!(/^(Truck|Trailer)$/i).test(text)) return sendMessage(chat, "Choose Truck or Trailer", ASK.assetType());
+      if (!/^(Truck|Trailer)$/i.test(text)) return sendMessage(chat, "Choose: Truck or Trailer", ASK.assetType());
       st.assetType = text;
       st.step = "assetNumber";
       await setState(chat, st);
-      return sendMessage(chat, "Asset number? e.g. 12345 or ABC-12");
+      return sendMessage(chat, "Enter unit number:");
     }
     case "assetNumber": {
-      if (!/^[A-Za-z0-9-]{3,}$/.test(text)) return sendMessage(chat, "Enter a valid asset number");
+      if (!/^[A-Za-z0-9-]{3,}$/.test(text)) return sendMessage(chat, "Enter a valid unit number");
       st.assetNumber = text.toUpperCase();
       st.step = "location";
       await setState(chat, st);
@@ -35,13 +43,13 @@ export async function onText(chat: number, text: string) {
       st.location = text;
       st.step = "repair";
       await setState(chat, st);
-      return sendMessage(chat, "Repair summary? (short)");
+      return sendMessage(chat, "Describe the repair (short):");
     }
     case "repair": {
       st.repair = text;
       st.step = "total";
       await setState(chat, st);
-      return sendMessage(chat, "Total amount? e.g. 1250.50 or $1,250.50");
+      return sendMessage(chat, "Total amount? Examples: 10, $10, 10,50");
     }
     case "total": {
       const n = parseAmount(text);
@@ -49,55 +57,76 @@ export async function onText(chat: number, text: string) {
       st.total = n;
       st.step = "comments";
       await setState(chat, st);
-      return sendMessage(chat, "Comments? (optional). Send '-' to skip");
+      return sendMessage(chat, "Any comments? If none, send '-'");
     }
     case "comments": {
       st.comments = text === "-" ? "" : text;
-      st.step = "reportedBy";
+      st.step = "invoice";
       await setState(chat, st);
-      return sendMessage(chat, "Who is reporting?", ASK.reporter());
-    }
-    case "reportedBy": {
-      st.reportedBy = text;
-      st.step = "photo";
-      await setState(chat, st);
-      return sendMessage(chat, "Send the invoice photo now");
+      return sendMessage(chat, "Send invoice photo or file.");
     }
     default:
       return sendMessage(chat, "Use /new to start.");
   }
 }
 
-export async function onPhoto(chat: number, messageId: number, photos: any[], date: number) {
+export async function onPhotoOrDoc(
+  chat: number,
+  messageId: number,
+  photos: any[] | null,
+  document: any | null,
+  date: number,
+  from: any,
+) {
   const st = await getState(chat);
-  if (!st || st.step !== "photo") return sendMessage(chat, "Use /new to start.");
-  const best = photos[photos.length - 1];
-  const { url } = await getFile(best.file_id);
-  const title = `${st.assetType}-${st.assetNumber}-${date}`;
-  const link = await uploadInvoiceFromUrl(title, url);
+  if (!st || st.step !== "invoice") return sendMessage(chat, "Use /new to start.");
 
-  const msgKey = `${chat}:${messageId}`;
-  if (!(await setnx(msgKey))) return sendMessage(chat, "Duplicate ignored");
+  try {
+    await sendMessage(chat, "Processing...");
+    let fileUrl = "", mime = "image/jpeg";
 
-  const iso = new Date(date * 1000).toISOString();
-  await appendRow([
-    iso,
-    st.assetType,
-    st.assetNumber,
-    st.location,
-    st.repair,
-    st.total,
-    st.comments || "",
-    st.reportedBy,
-    link,
-    msgKey,
-  ]);
-  await setState(chat, null);
-  return sendMessage(chat, "Saved");
+    if (photos && photos.length) {
+      const best = photos[photos.length - 1];
+      const f = await getFile(best.file_id);
+      fileUrl = f.url;
+      mime = "image/jpeg";
+    } else if (document) {
+      const f = await getFile(document.file_id);
+      fileUrl = f.url;
+      mime = document.mime_type || "application/octet-stream";
+    } else {
+      return sendMessage(chat, "Send a photo or a file (PDF/JPG).");
+    }
+
+    const title = `${st.assetType}-${st.assetNumber}-${date}`;
+    const link = await uploadInvoiceFromUrl(title, fileUrl, mime);
+
+    const msgKey = `${chat}:${messageId}`;
+    if (!(await setnx(msgKey))) return sendMessage(chat, "Duplicate ignored");
+
+    const iso = new Date(date * 1000).toISOString();
+    await appendRow([
+      iso,
+      st.assetType,
+      st.assetNumber,
+      st.location,
+      st.repair,
+      st.total,
+      st.comments || "",
+      st.reportedBy || resolveReporter(from),
+      link,
+      msgKey,
+    ]);
+    await setState(chat, null);
+    return sendMessage(chat, "Saved");
+  } catch (e) {
+    console.error("save error", e);
+    return sendMessage(chat, "Failed to save. Check Drive/Sheet access and try again.");
+  }
 }
 
 function parseAmount(s: string): number | null {
-  const t = s.replace(/[^0-9.,]/g, "").replace(/,/g, "");
+  const t = s.replace(/[^0-9.,]/g, "").replace(/,/g, ".");
   const n = Number(t);
   return Number.isFinite(n) ? Number(n.toFixed(2)) : null;
 }
