@@ -4,7 +4,7 @@ import { DRIVE_FOLDER_ID } from "../config.ts";
 async function mustOk(res: Response) {
   if (res.ok) return;
   const txt = await res.text();
-  throw new Error(`HTTP ${res.status}: ${txt}`);
+  throw new Error(`Drive HTTP ${res.status}: ${txt}`);
 }
 
 export async function uploadInvoiceFromUrl(title: string, url: string, mime = "image/jpeg") {
@@ -25,10 +25,12 @@ export async function uploadInvoiceFromUrl(title: string, url: string, mime = "i
   });
   await mustOk(up);
   const file = await up.json();
+
   await mustOk(await fetch(`https://www.googleapis.com/drive/v3/files/${file.id}/permissions`, {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ role: "reader", type: "anyone" }),
   }));
+
   return `https://drive.google.com/uc?id=${file.id}`;
 }
