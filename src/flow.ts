@@ -11,14 +11,14 @@ const ASK = {
 
 export async function start(chat: number) {
   await setState(chat, { step: "assetType" });
-  await sendMessage(chat, "Asset type?", { reply_keyboard: ASK.assetType() });
+  await sendMessage(chat, "Asset type?", ASK.assetType());
 }
 
 export async function onText(chat: number, text: string) {
   const st = await getState(chat) || { step: "assetType" };
   switch (st.step) {
     case "assetType": {
-      if (!(/^(Truck|Trailer)$/i).test(text)) return sendMessage(chat, "Choose Truck or Trailer", { reply_keyboard: ASK.assetType() });
+      if (!(/^(Truck|Trailer)$/i).test(text)) return sendMessage(chat, "Choose Truck or Trailer", ASK.assetType());
       st.assetType = text;
       st.step = "assetNumber";
       await setState(chat, st);
@@ -29,7 +29,7 @@ export async function onText(chat: number, text: string) {
       st.assetNumber = text.toUpperCase();
       st.step = "location";
       await setState(chat, st);
-      return sendMessage(chat, "Where was the repair?", { reply_keyboard: ASK.location() });
+      return sendMessage(chat, "Where was the repair?", ASK.location());
     }
     case "location": {
       st.location = text;
@@ -55,7 +55,7 @@ export async function onText(chat: number, text: string) {
       st.comments = text === "-" ? "" : text;
       st.step = "reportedBy";
       await setState(chat, st);
-      return sendMessage(chat, "Who is reporting?", { reply_keyboard: ASK.reporter() });
+      return sendMessage(chat, "Who is reporting?", ASK.reporter());
     }
     case "reportedBy": {
       st.reportedBy = text;
