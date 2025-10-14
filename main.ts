@@ -1,4 +1,4 @@
-// Deno Deploy: Telegram → Supabase (upsert) + Google Drive (SA) + Debug
+// Deno Deploy: Telegram → Supabase (upsert+REST fallback) + Google Drive (SA) + Deep Debug
 // ENV: BOT_TOKEN, DASHBOARD_URL, TIMEZONE
 // REPORT_CHAT_ID (opt), REPORT_THREAD_ID (opt)
 // SUPABASE_URL, SUPABASE_KEY (service_role)
@@ -15,8 +15,8 @@ const REPORT_CHAT = Deno.env.get("REPORT_CHAT_ID") ?? "";
 const REPORT_THREAD = Deno.env.get("REPORT_THREAD_ID") ?? "";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
-const SUPABASE_KEY = Deno.env.get("SUPABASE_KEY") ?? "";
-const sb = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } });
+const SUPABASE_KEY = Deno.env.get("SUPABASE_KEY") ?? ""; // service_role
+const sb = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false }, db: { schema: "public" } });
 
 const GDRIVE_FOLDER_ID = Deno.env.get("GDRIVE_FOLDER_ID") ?? "";
 const GDRIVE_SA_EMAIL = Deno.env.get("GDRIVE_SA_EMAIL") ?? "";
@@ -24,7 +24,7 @@ const GDRIVE_SA_KEY_RAW = Deno.env.get("GDRIVE_SA_KEY") ?? "";
 
 const kv = await Deno.openKv();
 
-// utils
+// ------------ utils ------------
 const j = (x: unknown) => JSON.stringify(x);
 const json = (x: unknown, s = 200) => new Response(j(x), { status: s, headers: { "content-type": "application/json" } });
 const firstLine = (t = "") => t.split(/\r?\n/).map(s => s.trim()).filter(Boolean)[0] ?? "";
@@ -45,7 +45,7 @@ async function logErr(tag: string, detail: unknown) {
   await kv.set(["err", Date.now()], rec, { expireIn: 6*3600_000 });
 }
 
-// Telegram
+// ------------ Telegram ------------
 async function tg(method: string, payload: unknown) {
   const r = await fetch(`${API}/${method}`, { method: "POST", headers: { "content-type": "application/json" }, body: j(payload) });
   if (!r.ok) throw new Error(`${method} ${r.status} ${await r.text()}`);
@@ -68,14 +68,12 @@ async function downloadTelegramFile(file_id: string): Promise<{ bytes: Uint8Arra
   return { bytes: new Uint8Array(ab), mime, filename: path.split("/").pop() || "file" };
 }
 
-// Google Drive SA
+// ------------ Google Drive SA ------------
 function pemFromEnv(raw: string) {
   let s = (raw || "").trim();
   if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) s = s.slice(1, -1);
   s = s.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n").replace(/\r\n/g, "\n");
-  if (!s.includes("BEGIN PRIVATE KEY") || !s.includes("END PRIVATE KEY")) {
-    throw new Error("Bad Google SA PEM: header/footer missing");
-  }
+  if (!s.includes("BEGIN PRIVATE KEY") || !s.includes("END PRIVATE KEY")) throw new Error("Bad Google SA PEM");
   return s;
 }
 async function saAccessToken(): Promise<string> {
@@ -86,18 +84,20 @@ async function saAccessToken(): Promise<string> {
   const jwt = await new SignJWT({ scope: "https://www.googleapis.com/auth/drive" })
     .setProtectedHeader({ alg: "RS256", typ: "JWT" }).setIssuer(GDRIVE_SA_EMAIL).setSubject(GDRIVE_SA_EMAIL)
     .setAudience(aud).setIssuedAt(now).setExpirationTime(now + 3600).sign(key);
-  const r = await fetch(aud, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion: jwt }) });
+  const r = await fetch(aud, {
+    method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion: jwt })
+  });
   if (!r.ok) { await logErr("drive/token-failed", { status: r.status, text: await r.text() }); throw new Error("token failed"); }
   const data = await r.json(); return data.access_token as string;
 }
 function multipartMetaMedia(meta: Record<string,unknown>, media: Uint8Array, mime: string) {
   const boundary = "deno-" + crypto.randomUUID(); const enc = new TextEncoder();
-  const part1 = enc.encode(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(meta)}\r\n`);
-  const part2 = enc.encode(`--${boundary}\r\nContent-Type: ${mime}\r\n\r\n`);
-  const part3 = enc.encode(`\r\n--${boundary}--\r\n`);
-  const buf = new Uint8Array(part1.length + part2.length + media.length + part3.length);
-  buf.set(part1,0); buf.set(part2,part1.length); buf.set(media,part1.length+part2.length); buf.set(part3,part1.length+part2.length+media.length);
+  const p1 = enc.encode(`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(meta)}\r\n`);
+  const p2 = enc.encode(`--${boundary}\r\nContent-Type: ${mime}\r\n\r\n`);
+  const p3 = enc.encode(`\r\n--${boundary}--\r\n`);
+  const buf = new Uint8Array(p1.length + p2.length + media.length + p3.length);
+  buf.set(p1,0); buf.set(p2,p1.length); buf.set(media,p1.length+p2.length); buf.set(p3,p1.length+p2.length+media.length);
   return { body: buf, boundary };
 }
 async function driveUpload(bytes: Uint8Array, filename: string, mime: string) {
@@ -117,7 +117,7 @@ async function driveUpload(bytes: Uint8Array, filename: string, mime: string) {
   return `https://drive.google.com/uc?id=${file.id}&export=download`;
 }
 
-// data
+// ------------ data ------------
 type State = {
   step: "asset"|"unit"|"repair"|"total"|"paid"|"comments"|"file"|"confirm";
   asset: string; unit: string; repair: string; total: number;
@@ -134,13 +134,39 @@ const getState = async (uid: number) => (await kv.get<State>(kState(uid))).value
 const setState = (uid: number, st: State) => kv.set(kState(uid), st, { expireIn: 6 * 3600_000 });
 const clearState = (uid: number) => kv.delete(kState(uid));
 
-// db
+// ------------ DB write with REST fallback ------------
 async function upsertEntry(e: Entry) {
-  const { error } = await sb.from("entries").upsert(e, { onConflict: "msg_key" });
-  if (error) await logErr("db/upsert-failed", { code: error.code, message: error.message, details: error.details });
+  // try supabase-js upsert
+  const { error } = await sb.from("entries").upsert(e, { onConflict: "msg_key", ignoreDuplicates: false });
+  if (!error) return;
+
+  // log and fallback to REST
+  await logErr("db/upsert-failed-js", { code: error.code, message: error.message, details: error.details });
+
+  try {
+    const url = `${SUPABASE_URL}/rest/v1/entries`;
+    const r = await fetch(url, {
+      method: "POST",
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: `Bearer ${SUPABASE_KEY}`,
+        "Content-Type": "application/json",
+        Prefer: "resolution=merge-duplicates,return=representation"
+      },
+      body: JSON.stringify(e)
+    });
+    if (!r.ok) {
+      const txt = await r.text();
+      await logErr("db/upsert-failed-rest", { status: r.status, text: txt });
+      throw new Error(`REST upsert failed ${r.status}`);
+    }
+  } catch (err) {
+    await logErr("db/upsert-rest-ex", String(err));
+    throw err;
+  }
 }
 
-// UI
+// ------------ UI ------------
 const kbMain = { keyboard: [[{text:"➕ New entry"},{text:"📊 Dashboard"}],[{text:"🧾 Status"},{text:"❌ Cancel"}]], resize_keyboard:true };
 const ikAsset = { inline_keyboard: [[{text:"Truck",callback_data:"asset:Truck"},{text:"Trailer",callback_data:"asset:Trailer"}]] };
 const ikPaid  = { inline_keyboard: [[{text:"Company",callback_data:"paid:company"},{text:"Driver",callback_data:"paid:driver"}]] };
@@ -150,7 +176,7 @@ const preview = (s: State) =>
    `Total: $${s.total.toFixed(2)}`, `Paid by: ${s.paidBy.toUpperCase()}`, `Comments: ${s.comments || "-"}`,
    `Reporter: ${s.reporter}`, "", "Save this entry?"].join("\n");
 
-// handlers
+// ------------ handlers ------------
 async function onMessage(m: any) {
   if (!m.chat || m.chat.type !== "private") return;
   const uid = m.from.id as number;
@@ -250,7 +276,9 @@ async function onCallback(q: any) {
       reporter: st.reporter, file_id: st.file_id || "", file_url: fileUrl || "", msg_key: st.msg_key
     };
 
-    await upsertEntry(entry);
+    try { await upsertEntry(entry); }
+    catch { /* уже залогировано */ }
+
     await clearState(uid);
     await edit(q.message.chat.id, q.message.message_id, "ok");
     return answerCb(q.id);
@@ -259,7 +287,7 @@ async function onCallback(q: any) {
   return answerCb(q.id);
 }
 
-// webhook
+// ------------ webhook ------------
 async function handleHook(req: Request) {
   const u = (await req.json()) as Tg;
   if (typeof u.update_id === "number") {
@@ -271,15 +299,28 @@ async function handleHook(req: Request) {
   return json({ ok: true });
 }
 
-// HTTP
+// ------------ HTTP ------------
 Deno.serve(async (req) => {
   const url = new URL(req.url);
   if (req.method === "GET" && url.pathname === "/") return new Response("ok");
   if (req.method === "GET" && url.pathname === "/health") return json({ ok: true });
+
   if (req.method === "GET" && url.pathname === "/debug") {
     const last = (await kv.get(["err","last"])).value;
-    return json({ ok: true, env: { SB: !!SUPABASE_URL && !!SUPABASE_KEY, GDrive: !!GDRIVE_FOLDER_ID && !!GDRIVE_SA_EMAIL && !!GDRIVE_SA_KEY_RAW }, lastError: last ?? null });
+    // простая проверка доступа к таблице
+    let probe: unknown = null;
+    try {
+      const { data, error } = await sb.from("entries").select("msg_key").limit(1);
+      probe = error ? { error } : { ok: true, count: data?.length ?? 0 };
+    } catch (e) { probe = { ex: String(e) }; }
+    return json({
+      ok: true,
+      env: { SB_URL: !!SUPABASE_URL, SB_KEY: !!SUPABASE_KEY, GDRV: !!GDRIVE_FOLDER_ID && !!GDRIVE_SA_EMAIL && !!GDRIVE_SA_KEY_RAW },
+      dbProbe: probe,
+      lastError: last ?? null
+    });
   }
+
   if (req.method === "GET" && url.pathname === "/self-test") {
     try {
       const now = new Date().toISOString();
@@ -287,6 +328,25 @@ Deno.serve(async (req) => {
       return json({ ok: true });
     } catch (e) { await logErr("self-test", String(e)); return json({ ok: false, error: String(e) }, 500); }
   }
+
+  if (req.method === "GET" && url.pathname === "/db-test") {
+    // выдаёт точный ответ БД
+    const now = new Date().toISOString();
+    const row: Entry = { ts: now, asset: "Probe", unit: "P-001", repair: "DB probe", total: 9.99, paid_by: "company", comments: "probe", reporter: "system", file_id: "", file_url: "", msg_key: `dbprobe:${now}` };
+    const r1 = await sb.from("entries").upsert(row, { onConflict: "msg_key", ignoreDuplicates: false });
+    let restResp: any = null;
+    if (r1.error) {
+      const urlRest = `${SUPABASE_URL}/rest/v1/entries`;
+      const r = await fetch(urlRest, {
+        method: "POST",
+        headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json", Prefer: "resolution=merge-duplicates,return=representation" },
+        body: JSON.stringify(row)
+      });
+      restResp = { status: r.status, text: await r.text() };
+    }
+    return json({ js: { error: r1.error ?? null }, rest: restResp });
+  }
+
   if (req.method === "POST" && url.pathname === "/hook") return handleHook(req);
   return new Response("404", { status: 404 });
 });
