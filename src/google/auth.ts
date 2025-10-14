@@ -1,7 +1,15 @@
 import { GOOGLE_SA_JSON } from "../config.ts";
 
-// Minimal JWT for Google service account using WebCrypto
-const SA = JSON.parse(GOOGLE_SA_JSON);
+function parseSA(raw: string): any {
+  const s = raw.trim();
+  try { return JSON.parse(s); } catch {}
+  const unquoted = s.replace(/^"|"$/g, '').replace(/^'|'$/g, '');
+  try { return JSON.parse(unquoted); } catch {}
+  const unescaped = unquoted.replace(/\\n/g, "\n").replace(/\"/g, '"');
+  return JSON.parse(unescaped);
+}
+
+const SA = parseSA(GOOGLE_SA_JSON);
 const ISS = SA.client_email;
 const SCOPE = [
   "https://www.googleapis.com/auth/drive",
@@ -9,7 +17,6 @@ const SCOPE = [
 ].join(" ");
 const AUD = "https://oauth2.googleapis.com/token";
 
-// Convert PEM to CryptoKey
 async function importKey(pem: string) {
   const b64 = pem.replace(/-----[^-]+-----/g, "").replace(/\s+/g, "");
   const der = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0)).buffer;
