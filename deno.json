@@ -1,6 +1,4 @@
 {
-  "deploy": {
-    "project": "fleet-bot-deno",
-    "entrypoint": "main.ts"
-  }
+  "tasks": { "dev": "deno run -A src/main.ts" },
+  "deploy": { "project": "us-fleet-invoice-bot", "entrypoint": "src/main.ts" }
 }
