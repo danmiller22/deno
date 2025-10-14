@@ -15,7 +15,7 @@ const REPORT_CHAT = Deno.env.get("REPORT_CHAT_ID") ?? "";
 const REPORT_THREAD = Deno.env.get("REPORT_THREAD_ID") ?? "";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
-const SUPABASE_KEY = Deno.env.get("SUPABASE_KEY") ?? ""; // service_role
+const SUPABASE_KEY = Deno.env.get("SUPABASE_KEY") ?? "";
 const sb = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } });
 
 const GDRIVE_FOLDER_ID = Deno.env.get("GDRIVE_FOLDER_ID") ?? "";
@@ -24,7 +24,7 @@ const GDRIVE_SA_KEY_RAW = Deno.env.get("GDRIVE_SA_KEY") ?? "";
 
 const kv = await Deno.openKv();
 
-// ---------- utils ----------
+// utils
 const j = (x: unknown) => JSON.stringify(x);
 const json = (x: unknown, s = 200) => new Response(j(x), { status: s, headers: { "content-type": "application/json" } });
 const firstLine = (t = "") => t.split(/\r?\n/).map(s => s.trim()).filter(Boolean)[0] ?? "";
@@ -45,7 +45,7 @@ async function logErr(tag: string, detail: unknown) {
   await kv.set(["err", Date.now()], rec, { expireIn: 6*3600_000 });
 }
 
-// ---------- Telegram ----------
+// Telegram
 async function tg(method: string, payload: unknown) {
   const r = await fetch(`${API}/${method}`, { method: "POST", headers: { "content-type": "application/json" }, body: j(payload) });
   if (!r.ok) throw new Error(`${method} ${r.status} ${await r.text()}`);
@@ -68,11 +68,19 @@ async function downloadTelegramFile(file_id: string): Promise<{ bytes: Uint8Arra
   return { bytes: new Uint8Array(ab), mime, filename: path.split("/").pop() || "file" };
 }
 
-// ---------- Google Drive (Service Account) ----------
-function normalizePem(pem: string) { return pem.includes("\\n") ? pem.replace(/\\n/g, "\n") : pem; }
+// Google Drive SA
+function pemFromEnv(raw: string) {
+  let s = (raw || "").trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) s = s.slice(1, -1);
+  s = s.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n").replace(/\r\n/g, "\n");
+  if (!s.includes("BEGIN PRIVATE KEY") || !s.includes("END PRIVATE KEY")) {
+    throw new Error("Bad Google SA PEM: header/footer missing");
+  }
+  return s;
+}
 async function saAccessToken(): Promise<string> {
   if (!GDRIVE_SA_EMAIL || !GDRIVE_SA_KEY_RAW) { await logErr("drive/env-missing", { email: !!GDRIVE_SA_EMAIL, key: !!GDRIVE_SA_KEY_RAW }); throw new Error("drive env missing"); }
-  const key = await importPKCS8(normalizePem(GDRIVE_SA_KEY_RAW).trim(), "RS256");
+  const key = await importPKCS8(pemFromEnv(GDRIVE_SA_KEY_RAW), "RS256");
   const now = Math.floor(Date.now()/1000);
   const aud = "https://oauth2.googleapis.com/token";
   const jwt = await new SignJWT({ scope: "https://www.googleapis.com/auth/drive" })
@@ -109,7 +117,7 @@ async function driveUpload(bytes: Uint8Array, filename: string, mime: string) {
   return `https://drive.google.com/uc?id=${file.id}&export=download`;
 }
 
-// ---------- data models ----------
+// data
 type State = {
   step: "asset"|"unit"|"repair"|"total"|"paid"|"comments"|"file"|"confirm";
   asset: string; unit: string; repair: string; total: number;
@@ -126,13 +134,13 @@ const getState = async (uid: number) => (await kv.get<State>(kState(uid))).value
 const setState = (uid: number, st: State) => kv.set(kState(uid), st, { expireIn: 6 * 3600_000 });
 const clearState = (uid: number) => kv.delete(kState(uid));
 
-// ---------- Supabase (upsert on msg_key) ----------
+// db
 async function upsertEntry(e: Entry) {
   const { error } = await sb.from("entries").upsert(e, { onConflict: "msg_key" });
   if (error) await logErr("db/upsert-failed", { code: error.code, message: error.message, details: error.details });
 }
 
-// ---------- UI ----------
+// UI
 const kbMain = { keyboard: [[{text:"➕ New entry"},{text:"📊 Dashboard"}],[{text:"🧾 Status"},{text:"❌ Cancel"}]], resize_keyboard:true };
 const ikAsset = { inline_keyboard: [[{text:"Truck",callback_data:"asset:Truck"},{text:"Trailer",callback_data:"asset:Trailer"}]] };
 const ikPaid  = { inline_keyboard: [[{text:"Company",callback_data:"paid:company"},{text:"Driver",callback_data:"paid:driver"}]] };
@@ -142,7 +150,7 @@ const preview = (s: State) =>
    `Total: $${s.total.toFixed(2)}`, `Paid by: ${s.paidBy.toUpperCase()}`, `Comments: ${s.comments || "-"}`,
    `Reporter: ${s.reporter}`, "", "Save this entry?"].join("\n");
 
-// ---------- handlers ----------
+// handlers
 async function onMessage(m: any) {
   if (!m.chat || m.chat.type !== "private") return;
   const uid = m.from.id as number;
@@ -227,7 +235,6 @@ async function onCallback(q: any) {
   if (data === "confirm_save") {
     const tsStr = new Date().toISOString();
 
-    // Drive upload
     let fileUrl = "";
     if (st.file_id) {
       try {
@@ -252,7 +259,7 @@ async function onCallback(q: any) {
   return answerCb(q.id);
 }
 
-// ---------- webhook ----------
+// webhook
 async function handleHook(req: Request) {
   const u = (await req.json()) as Tg;
   if (typeof u.update_id === "number") {
@@ -264,7 +271,7 @@ async function handleHook(req: Request) {
   return json({ ok: true });
 }
 
-// ---------- HTTP ----------
+// HTTP
 Deno.serve(async (req) => {
   const url = new URL(req.url);
   if (req.method === "GET" && url.pathname === "/") return new Response("ok");
@@ -276,7 +283,6 @@ Deno.serve(async (req) => {
   if (req.method === "GET" && url.pathname === "/self-test") {
     try {
       const now = new Date().toISOString();
-      // upsert тест без файла
       await upsertEntry({ ts: now, asset: "Test", unit: "T-001", repair: "Self-test", total: 1.23, paid_by: "company", comments: "self", reporter: "system", file_id: "", file_url: "", msg_key: `selftest:${now}` });
       return json({ ok: true });
     } catch (e) { await logErr("self-test", String(e)); return json({ ok: false, error: String(e) }, 500); }
