@@ -33,9 +33,8 @@ async function gdriveUpload(bytes: Uint8Array, mime: string, name: string) {
   });
   return `https://drive.google.com/uc?id=${id}`;
 }
-
 export async function saveToDrive(_ctx: unknown, fileId: string): Promise<string> {
   const path = await tgFilePath(fileId);
-  const file = await tgDownload(path);
-  return await gdriveUpload(file.bytes, file.mime, file.name);
+  const f = await tgDownload(path);
+  return await gdriveUpload(f.bytes, f.mime, f.name);
 }
