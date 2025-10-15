@@ -1,4 +1,3 @@
-// src/main.ts
 export default async function (req: Request): Promise<Response> {
   const p = new URL(req.url).pathname;
 
@@ -6,12 +5,10 @@ export default async function (req: Request): Promise<Response> {
 
   if (p === "/telegram" || p === "/telegram/") {
     if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
-
     try {
-      const { webhookCallback } = await import("https://deno.land/x/grammy@v1.25.4/mod.ts");
+      const { webhookCallback } = await import("https://deno.land/x/grammy@v1.25.1/mod.ts");
       const { bot } = await import("./telegram.ts");
-      const wh = webhookCallback(bot, "std/http");
-      return await wh(req);
+      return await webhookCallback(bot, "std/http")(req);
     } catch (e) {
       console.error("BOOT_ERR", e?.stack ?? String(e));
       return new Response("boot error", { status: 500 });
