@@ -40,11 +40,17 @@ export async function onFile(ctx: TgCtx) {
   if(!fileId) return ctx.reply("Attach a photo or file.");
   try{ d.invoiceLink = await saveToDrive(ctx,fileId); }catch{ d.invoiceLink=""; }
   const asset = d.kind==="TRK"?`TRK ${d.trk}`:`TRL ${d.trl} — TRK ${d.trk}`;
-  const row = [
-    new Date().toLocaleDateString("en-US"),
-    asset, d.repair||"", (d.total??0).toString(), "", username(ctx), d.invoiceLink||"", d.comments||"", `m:${Date.now()}`
-  ];
-  try{ await appendRow(row); await ctx.reply("Saved ✅", {reply_markup:{remove_keyboard:true}}); }
-  catch{ await ctx.reply("Failed to save. Check Drive/Sheet access and try again."); }
-  SESS.set(id,{step:"IDLE"});
-}
+ const row = [
+  new Date().toISOString(),   // Date (A)
+  asset,                      // Asset (B)
+  d.repair || "",             // Repair (C)
+  (d.total ?? 0).toString(),  // Total (D)
+  "",                         // PaidBy (E)
+  (() => {
+    const u = username(ctx);
+    return u.startsWith("@") ? u : `@${u}`;
+  })(),                       // ReportedBy (F)
+  d.invoiceLink || "",        // InvoiceLink (G)
+  d.comments || "",           // Comments (H)
+  `m:${Date.now()}`,          // MsgKey (если есть колонка дальше)
+];
