@@ -1,142 +1,172 @@
-import { kb, sendMessage, getFile } from "./telegram.ts";
+// src/flow.ts
 import { appendRow } from "./google/sheets.ts";
-import { uploadInvoiceFromUrl } from "./google/drive.ts";
-import { getState, setState, setnx } from "./kv.ts";
+import { saveToDrive } from "./google/drive.ts";
+import type { TgCtx } from "./telegram.ts";
 
-const ASK = {
-  assetType: () => kb([["Truck","Trailer"]]),
-  location:  () => kb([["Shop","Roadside"],["Yard","TA/Petro"],["Loves","Other"]]),
-  paidBy:    () => kb([["company","driver"]]),
+type Kind = "TRK" | "TRL";
+type Step =
+  | "IDLE"
+  | "ASK_KIND"
+  | "ASK_TRK_NUM"
+  | "ASK_TRL_NUM"
+  | "ASK_TRL_TRK_NUM"
+  | "ASK_REPAIR"
+  | "ASK_TOTAL"
+  | "ASK_COMMENTS"
+  | "ASK_INVOICE";
+
+type Draft = {
+  step: Step;
+  kind?: Kind;
+  trk?: string;
+  trl?: string;
+  repair?: string;
+  total?: number;
+  comments?: string;
+  invoiceLink?: string;
+  msgKey?: string;
 };
 
-function resolveReporter(from:any): string {
-  if (!from) return "Unknown";
-  if (from.username) return `@${from.username}`;
-  const n = [from.first_name, from.last_name].filter(Boolean).join(" ");
-  return n || "Unknown";
-}
-function formatAsset(type:string, num:string) {
-  return /^Trailer$/i.test(type) ? `TRL ${num}` : `unit ${num}`;
-}
-function parseAmount(s: string): number | null {
-  const t = s.replace(/[^0-9.,]/g, "").replace(/,/g, ".");
-  const n = Number(t);
-  return Number.isFinite(n) ? Number(n.toFixed(2)) : null;
+const SESS = new Map<number, Draft>();
+
+function username(ctx: TgCtx) {
+  const u = ctx.message?.from || ctx.callback_query?.from;
+  return u?.username || `${u?.first_name || ""} ${u?.last_name || ""}`.trim() || "unknown";
 }
 
-export async function start(chat: number, from: any) {
-  await setState(chat, { step: "assetType", reportedBy: resolveReporter(from) });
-  await sendMessage(chat, "New entry");
-  await sendMessage(chat, "Select asset type:", ASK.assetType());
-}
-
-export async function onText(chat: number, text: string, from: any) {
-  const st = await getState(chat) || { step: "assetType", reportedBy: resolveReporter(from) };
-
-  switch (st.step) {
-    case "assetType": {
-      if (!/^(Truck|Trailer)$/i.test(text)) return sendMessage(chat, "Choose: Truck or Trailer", ASK.assetType());
-      st.assetType = text;
-      st.step = "assetNumber";
-      await setState(chat, st);
-      return sendMessage(chat, "Enter unit number:");
-    }
-    case "assetNumber": {
-      if (!/^[A-Za-z0-9- ]{2,}$/.test(text)) return sendMessage(chat, "Enter a valid unit number");
-      st.assetNumber = text.trim();
-      st.step = "location";
-      await setState(chat, st);
-      return sendMessage(chat, "Where was the repair?", ASK.location());
-    }
-    case "location": {
-      st.location = text;
-      st.step = "repair";
-      await setState(chat, st);
-      return sendMessage(chat, "Describe the repair (short):");
-    }
-    case "repair": {
-      st.repair = text;
-      st.step = "total";
-      await setState(chat, st);
-      return sendMessage(chat, "Total amount? Examples: 10, $10, 10,50");
-    }
-    case "total": {
-      const n = parseAmount(text);
-      if (n == null) return sendMessage(chat, "Enter a valid amount");
-      st.total = n;
-      st.step = "comments";
-      await setState(chat, st);
-      return sendMessage(chat, "Any comments? If none, send '-'");
-    }
-    case "comments": {
-      st.comments = text === "-" ? "" : text;
-      st.step = "paidBy";
-      await setState(chat, st);
-      return sendMessage(chat, "Paid by?", ASK.paidBy());
-    }
-    case "paidBy": {
-      if (!/^(company|driver)$/i.test(text)) return sendMessage(chat, "Choose who paid", ASK.paidBy());
-      st.paidBy = text.toLowerCase();
-      st.step = "invoice";
-      await setState(chat, st);
-      return sendMessage(chat, "Send invoice photo or file (PDF/JPG).");
-    }
-    default:
-      return sendMessage(chat, "Use /new to start.");
+function ensure(chatId: number): Draft {
+  let d = SESS.get(chatId);
+  if (!d) {
+    d = { step: "ASK_KIND" };
+    SESS.set(chatId, d);
   }
+  return d;
 }
 
-export async function onPhotoOrDoc(
-  chat: number,
-  messageId: number,
-  photos: any[] | null,
-  document: any | null,
-  date: number,
-  from: any,
-) {
-  const st = await getState(chat);
-  if (!st || st.step !== "invoice") return sendMessage(chat, "Use /new to start.");
+export async function startFlow(ctx: TgCtx) {
+  const chatId = ctx.chat.id;
+  SESS.set(chatId, { step: "ASK_KIND" });
+  await ctx.reply("Choose asset:", {
+    reply_markup: {
+      keyboard: [
+        [{ text: "TRK" }, { text: "TRL" }],
+      ],
+      resize_keyboard: true,
+      one_time_keyboard: true,
+    },
+  });
+}
+
+export async function onText(ctx: TgCtx) {
+  const chatId = ctx.chat.id;
+  const text = (ctx.message?.text || "").trim();
+  const d = ensure(chatId);
+
+  // normalize quick actions
+  if (/^new entry$/i.test(text)) return startFlow(ctx);
+
+  if (d.step === "ASK_KIND") {
+    if (text === "TRK" || text === "TRL") {
+      d.kind = text as Kind;
+      if (d.kind === "TRK") {
+        d.step = "ASK_TRK_NUM";
+        return ctx.reply("Enter TRK unit number:");
+      } else {
+        d.step = "ASK_TRL_NUM";
+        return ctx.reply("Enter TRL unit number:");
+      }
+    }
+    return ctx.reply("Tap TRK or TRL.");
+  }
+
+  if (d.step === "ASK_TRK_NUM") {
+    d.trk = text;
+    d.step = "ASK_REPAIR";
+    return ctx.reply("Describe the repair (short):");
+  }
+
+  if (d.step === "ASK_TRL_NUM") {
+    d.trl = text;
+    d.step = "ASK_TRL_TRK_NUM";
+    return ctx.reply("Which TRK was the trailer with? Enter TRK unit number:");
+  }
+
+  if (d.step === "ASK_TRL_TRK_NUM") {
+    d.trk = text;
+    d.step = "ASK_REPAIR";
+    return ctx.reply("Describe the repair (short):");
+  }
+
+  if (d.step === "ASK_REPAIR") {
+    d.repair = text;
+    d.step = "ASK_TOTAL";
+    return ctx.reply("Total amount? Examples: 10, $10, 10.50");
+  }
+
+  if (d.step === "ASK_TOTAL") {
+    const m = text.replace(/[^0-9.\-]/g, "");
+    const val = Number(m);
+    if (!isFinite(val)) return ctx.reply("Send a number like 10 or 10.50");
+    d.total = val;
+    d.step = "ASK_COMMENTS";
+    return ctx.reply("Any comments? If none, send '-'");
+  }
+
+  if (d.step === "ASK_COMMENTS") {
+    d.comments = text === "-" ? "" : text;
+    d.step = "ASK_INVOICE";
+    return ctx.reply("Send invoice photo or file.");
+  }
+
+  // if idle, allow restart
+  if (d.step === "IDLE") return startFlow(ctx);
+}
+
+export async function onFile(ctx: TgCtx) {
+  const chatId = ctx.chat.id;
+  const d = ensure(chatId);
+  if (d.step !== "ASK_INVOICE") return;
+
+  const fileId =
+    ctx.message?.document?.file_id ||
+    ctx.message?.photo?.at(-1)?.file_id ||
+    ctx.message?.video?.file_id;
+
+  if (!fileId) return ctx.reply("Attach a photo or file.");
 
   try {
-    await sendMessage(chat, "Processing...");
-    let fileUrl = "", mime = "image/jpeg";
-
-    if (photos && photos.length) {
-      const best = photos[photos.length - 1];
-      const f = await getFile(best.file_id);
-      fileUrl = f.url; mime = "image/jpeg";
-    } else if (document) {
-      const f = await getFile(document.file_id);
-      fileUrl = f.url; mime = document.mime_type || "application/octet-stream";
-    } else {
-      return sendMessage(chat, "Send a photo or a file (PDF/JPG).");
-    }
-
-    const msgKey = `${chat}:${messageId}`;
-    if (!(await setnx(msgKey))) return sendMessage(chat, "Duplicate ignored");
-
-    const title = `${st.assetType}-${st.assetNumber}-${date}`;
-    const link = await uploadInvoiceFromUrl(title, fileUrl, mime);
-    const iso = new Date(date * 1000).toISOString();
-
-    // Порядок колонок под твою таблицу:
-    // Date | Asset | Repair | Total Amount | InvoiceLink | PaidBy | Comments | ReportedBy
-    await appendRow([
-      iso,
-      formatAsset(st.assetType, st.assetNumber),
-      st.repair,
-      st.total,
-      link,
-      st.paidBy || "company",
-      st.comments || "",
-      st.reportedBy || resolveReporter(from),
-    ]);
-
-    await setState(chat, null);
-    return sendMessage(chat, "Saved");
+    const link = await saveToDrive(ctx, fileId);
+    d.invoiceLink = link;
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    console.error("save error", e);
-    return sendMessage(chat, `Failed: ${msg}`);
+    // допускаем пустую ссылку, но не валим флоу
+    d.invoiceLink = "";
   }
+
+  // Build Asset string
+  const asset =
+    d.kind === "TRK"
+      ? `TRK ${d.trk}`
+      : `TRL ${d.trl} — TRK ${d.trk}`;
+
+  // Prepare row (без вопроса “Where was the repair” — удалён)
+  const row = [
+    new Date().toLocaleDateString("en-US"),
+    asset,
+    d.repair || "",
+    (d.total ?? 0).toString(),
+    "",                    // PaidBy (заполняется вручную/ботом отдельно при необходимости)
+    username(ctx),         // ReportedBy
+    d.invoiceLink || "",   // InvoiceLink
+    d.comments || "",      // Comments
+    `m:${Date.now()}`,     // MsgKey
+  ];
+
+  try {
+    await appendRow(row);
+    await ctx.reply("Saved ✅", { reply_markup: { remove_keyboard: true } });
+  } catch (e) {
+    await ctx.reply("Failed to save. Check Drive/Sheet access and try again.");
+  }
+
+  SESS.set(chatId, { step: "IDLE" });
 }
