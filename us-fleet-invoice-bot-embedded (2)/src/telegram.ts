@@ -1,6 +1,6 @@
 // src/telegram.ts
 // Обработчик апдейтов Telegram. Клавиатуры и роутинг.
-import { Bot } from "https://deno.land/x/grammy@v1.26.1/mod.ts";
+import { Bot } from "https://deno.land/x/grammy@v1.19.1/mod.ts";
 import { startFlow, onText, onFile } from "./flow.ts";
 import { TELEGRAM_TOKEN } from "./config.ts";
 
