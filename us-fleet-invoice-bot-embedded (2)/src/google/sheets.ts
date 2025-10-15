@@ -1,13 +1,14 @@
 import { SHEET_ID, SHEET_NAME } from "../config.ts";
 import { getAccessToken } from "./auth.ts";
 
+const RANGE = encodeURIComponent(`${SHEET_NAME}!A:H`);
+
 export async function appendRow(values: (string | number)[]) {
   const token = await getAccessToken();
-  const url = `https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${encodeURIComponent(SHEET_NAME)}!A1:append?valueInputOption=USER_ENTERED`;
-  const r = await fetch(url, {
+  const r = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${SHEET_ID}/values/${RANGE}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`, {
     method: "POST",
-    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+    headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ values: [values] }),
   });
-  if (!r.ok) throw new Error(`Sheets ${r.status} ${await r.text()}`);
+  if (!r.ok) throw new Error(await r.text());
 }
