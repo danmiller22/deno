@@ -1,46 +1,15 @@
-import { SA_JSON } from "../config.ts";
+// Чистый вариант: только GOOGLE_CLIENT_EMAIL и GOOGLE_PRIVATE_KEY
+const CLIENT_EMAIL = (Deno.env.get("GOOGLE_CLIENT_EMAIL") || "").trim();
+let PRIVATE_KEY = Deno.env.get("GOOGLE_PRIVATE_KEY") || "";
 
-type SA = { client_email: string; private_key: string; token_uri?: string };
-
-function isBase64(s: string) {
-  return /^[A-Za-z0-9+/=]+$/.test(s) && s.length % 4 === 0;
+if (!CLIENT_EMAIL || !PRIVATE_KEY) {
+  throw new Error("Missing GOOGLE_CLIENT_EMAIL or GOOGLE_PRIVATE_KEY");
 }
 
-function loadSA(): SA {
-  const raw = (SA_JSON || "").trim();
+// поддержка \n в одном строковом значении
+PRIVATE_KEY = PRIVATE_KEY.replace(/\\n/g, "\n");
 
-  // 1) Чистый JSON
-  if (raw.startsWith("{")) {
-    const obj = JSON.parse(raw) as SA;
-    obj.private_key = obj.private_key.replace(/\\n/g, "\n");
-    return obj;
-  }
-
-  // 2) base64(JSON)
-  if (isBase64(raw)) {
-    const txt = new TextDecoder().decode(
-      Uint8Array.from(atob(raw), c => c.charCodeAt(0)),
-    );
-    const obj = JSON.parse(txt) as SA;
-    obj.private_key = obj.private_key.replace(/\\n/g, "\n");
-    return obj;
-  }
-
-  // 3) Парами переменных
-  const email = Deno.env.get("GOOGLE_CLIENT_EMAIL")?.trim();
-  let pk = Deno.env.get("GOOGLE_PRIVATE_KEY") || "";
-  if (email && pk) {
-    pk = pk.replace(/\\n/g, "\n");
-    return { client_email: email, private_key: pk, token_uri: "https://oauth2.googleapis.com/token" };
-  }
-
-  throw new Error(
-    "Invalid GOOGLE_SERVICE_ACCOUNT_JSON. Provide raw JSON, base64(JSON), or set GOOGLE_CLIENT_EMAIL and GOOGLE_PRIVATE_KEY.",
-  );
-}
-
-const sa = loadSA();
-
+const TOKEN_URI = "https://oauth2.googleapis.com/token";
 const SCOPE = [
   "https://www.googleapis.com/auth/spreadsheets",
   "https://www.googleapis.com/auth/drive",
@@ -55,30 +24,31 @@ export async function getAccessToken(): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
   const header = b64u(JSON.stringify({ alg: "RS256", typ: "JWT" }));
   const claim = b64u(JSON.stringify({
-    iss: sa.client_email,
+    iss: CLIENT_EMAIL,
     scope: SCOPE,
-    aud: sa.token_uri || "https://oauth2.googleapis.com/token",
+    aud: TOKEN_URI,
     exp: now + 3600,
     iat: now,
   }));
 
-  const enc = new TextEncoder().encode(`${header}.${claim}`);
+  const data = new TextEncoder().encode(`${header}.${claim}`);
+
+  // импорт PKCS8 из PEM
+  const pemBody = PRIVATE_KEY.replace(/-----[^-]+-----/g, "").replace(/\s+/g, "");
+  const pkcs8 = Uint8Array.from(atob(pemBody), c => c.charCodeAt(0)).buffer;
 
   const key = await crypto.subtle.importKey(
     "pkcs8",
-    (() => {
-      const pem = sa.private_key.replace(/-----[^-]+-----/g, "").replace(/\s+/g, "");
-      return Uint8Array.from(atob(pem), c => c.charCodeAt(0)).buffer;
-    })(),
+    pkcs8,
     { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
     false,
     ["sign"],
   );
 
-  const sig = new Uint8Array(await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, enc));
+  const sig = new Uint8Array(await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, data));
   const jwt = `${header}.${claim}.${b64u(sig)}`;
 
-  const r = await fetch(sa.token_uri || "https://oauth2.googleapis.com/token", {
+  const r = await fetch(TOKEN_URI, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
