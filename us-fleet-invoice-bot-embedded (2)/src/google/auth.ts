@@ -1,22 +1,45 @@
 import { SA_JSON } from "../config.ts";
 
-function loadSA() {
-  const raw = SA_JSON.trim();
-  let txt = raw;
-  if (!raw.startsWith("{")) {
-    try {
-      txt = new TextDecoder().decode(
-        Uint8Array.from(atob(raw), c => c.charCodeAt(0)),
-      );
-    } catch {
-      throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON must be raw JSON or base64(JSON).");
-    }
-  }
-  return JSON.parse(txt);
+type SA = { client_email: string; private_key: string; token_uri?: string };
+
+function isBase64(s: string) {
+  return /^[A-Za-z0-9+/=]+$/.test(s) && s.length % 4 === 0;
 }
 
-type SA = { client_email: string; private_key: string; token_uri?: string };
-const sa: SA = loadSA();
+function loadSA(): SA {
+  const raw = (SA_JSON || "").trim();
+
+  // 1) Чистый JSON
+  if (raw.startsWith("{")) {
+    const obj = JSON.parse(raw) as SA;
+    obj.private_key = obj.private_key.replace(/\\n/g, "\n");
+    return obj;
+  }
+
+  // 2) base64(JSON)
+  if (isBase64(raw)) {
+    const txt = new TextDecoder().decode(
+      Uint8Array.from(atob(raw), c => c.charCodeAt(0)),
+    );
+    const obj = JSON.parse(txt) as SA;
+    obj.private_key = obj.private_key.replace(/\\n/g, "\n");
+    return obj;
+  }
+
+  // 3) Парами переменных
+  const email = Deno.env.get("GOOGLE_CLIENT_EMAIL")?.trim();
+  let pk = Deno.env.get("GOOGLE_PRIVATE_KEY") || "";
+  if (email && pk) {
+    pk = pk.replace(/\\n/g, "\n");
+    return { client_email: email, private_key: pk, token_uri: "https://oauth2.googleapis.com/token" };
+  }
+
+  throw new Error(
+    "Invalid GOOGLE_SERVICE_ACCOUNT_JSON. Provide raw JSON, base64(JSON), or set GOOGLE_CLIENT_EMAIL and GOOGLE_PRIVATE_KEY.",
+  );
+}
+
+const sa = loadSA();
 
 const SCOPE = [
   "https://www.googleapis.com/auth/spreadsheets",
@@ -38,7 +61,9 @@ export async function getAccessToken(): Promise<string> {
     exp: now + 3600,
     iat: now,
   }));
+
   const enc = new TextEncoder().encode(`${header}.${claim}`);
+
   const key = await crypto.subtle.importKey(
     "pkcs8",
     (() => {
@@ -49,6 +74,7 @@ export async function getAccessToken(): Promise<string> {
     false,
     ["sign"],
   );
+
   const sig = new Uint8Array(await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, enc));
   const jwt = `${header}.${claim}.${b64u(sig)}`;
 
@@ -60,6 +86,7 @@ export async function getAccessToken(): Promise<string> {
       assertion: jwt,
     }),
   });
+
   const j = await r.json();
   if (!r.ok) throw new Error(JSON.stringify(j));
   return j.access_token as string;
