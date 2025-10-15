@@ -4,11 +4,18 @@ export default async function (req: Request): Promise<Response> {
 
   if (p === "/health") return new Response("ok", { status: 200 });
 
-  if (p === "/telegram" || p.startsWith("/telegram/")) {
+  if (p === "/telegram" || p === "/telegram/") {
     if (req.method !== "POST") return new Response("method not allowed", { status: 405 });
-    const { webhookCallback } = await import("https://deno.land/x/grammy@v1.25.4/mod.ts");
-    const { bot } = await import("./telegram.ts");
-    return await webhookCallback(bot, "std/http")(req);
+
+    try {
+      const { webhookCallback } = await import("https://deno.land/x/grammy@v1.25.4/mod.ts");
+      const { bot } = await import("./telegram.ts");
+      const wh = webhookCallback(bot, "std/http");
+      return await wh(req);
+    } catch (e) {
+      console.error("BOOT_ERR", e?.stack ?? String(e));
+      return new Response("boot error", { status: 500 });
+    }
   }
 
   return new Response("US Fleet bot is up\n/health • /telegram", {
